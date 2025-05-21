@@ -1,0 +1,161 @@
+#!/bin/bash
+
+# --- Configuration ---
+EBOOK_SOURCE_ROOT="/mnt/user/the_big_one/media/ebooks"
+AUDIOBOOKSHELF_LIBRARY_ROOT="/mnt/user/the_big_one/media/books"
+
+LOG_FILE="/mnt/user/system/logs/hardlink_ebooks_to_library.log"
+VERBOSE_LOGGING="true"
+TEST_MODE="true" ###########################################################
+                 # SET TO "false" TO PERFORM ACTUAL HARDLINKING AND DIRECTORY CREATION #
+                 ###########################################################
+
+# Define known ebook file extensions to help identify actual book content folders.
+# The script will then hardlink ALL files from an identified book folder.
+EBOOK_FILE_PATTERNS_FOR_FOLDER_ID=(-iname "*.epub" -o -iname "*.mobi" -o -iname "*.azw3" -o -iname "*.pdf")
+# --- End Configuration ---
+
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+# Function for verbose logging
+verbose_log() {
+    if [ "$VERBOSE_LOGGING" == "true" ]; then
+        log_message "VERBOSE: $1"
+    fi
+}
+
+# Ensure log directory exists
+mkdir -p "$(dirname "$LOG_FILE")"
+
+log_message "--- Script Started: Hardlinking Ebook Files into Main Library ---"
+if [ "$TEST_MODE" == "true" ]; then
+    log_message "--- !!! RUNNING IN TEST MODE - NO FILE SYSTEM CHANGES WILL BE MADE !!! ---"
+fi
+log_message "Ebook Source Root: $EBOOK_SOURCE_ROOT"
+log_message "Audiobookshelf/Target Library Root: $AUDIOBOOKSHELF_LIBRARY_ROOT"
+
+# Check if Ebook source path exists
+if [ ! -d "$EBOOK_SOURCE_ROOT" ]; then
+    log_message "ERROR: Ebook source root '$EBOOK_SOURCE_ROOT' does not exist. Exiting."
+    exit 1
+fi
+
+# Ensure Audiobookshelf/Target root path exists
+if [ ! -d "$AUDIOBOOKSHELF_LIBRARY_ROOT" ]; then
+    if [ "$TEST_MODE" == "true" ]; then
+        log_message "TEST MODE: Audiobookshelf/Target root directory '$AUDIOBOOKSHELF_LIBRARY_ROOT' does not exist. Would attempt to create it."
+    else
+        if ! mkdir -p "$AUDIOBOOKSHELF_LIBRARY_ROOT"; then
+             log_message "ERROR: Could not create Audiobookshelf/Target root directory '$AUDIOBOOKSHELF_LIBRARY_ROOT'. Check permissions. Exiting."
+            exit 1
+        else
+            log_message "CREATED Audiobookshelf/Target root directory '$AUDIOBOOKSHELF_LIBRARY_ROOT'."
+        fi
+    fi
+elif [ "$VERBOSE_LOGGING" == "true" ] || [ "$TEST_MODE" == "true" ]; then # Log if verbose or in test mode
+     verbose_log "Audiobookshelf/Target root directory '$AUDIOBOOKSHELF_LIBRARY_ROOT' already exists."
+fi
+
+
+# Construct the find command part for ebook file patterns
+pattern_conditions=$(IFS=" " echo "${EBOOK_FILE_PATTERNS_FOR_FOLDER_ID[*]}")
+
+# Find all unique directories in EBOOK_SOURCE_ROOT that directly contain common ebook files
+find "$EBOOK_SOURCE_ROOT" -type f \( $pattern_conditions \) -print0 | xargs -0 -n1 dirname | sort -u | while IFS= read -r source_actual_ebook_folder; do
+    if [ -z "$source_actual_ebook_folder" ]; then
+        continue
+    fi
+    verbose_log "Processing source ebook folder: '$source_actual_ebook_folder'"
+
+    relative_path_of_book_folder="${source_actual_ebook_folder#$EBOOK_SOURCE_ROOT/}"
+    verbose_log "  Relative path of book folder: '$relative_path_of_book_folder'"
+
+    if [ -z "$relative_path_of_book_folder" ] || [ "$relative_path_of_book_folder" == "$source_actual_ebook_folder" ]; then
+        log_message "  ERROR: Could not determine a valid relative path for '$source_actual_ebook_folder' (is it not under EBOOK_SOURCE_ROOT, or is EBOOK_SOURCE_ROOT empty/incorrect?). Skipping."
+        continue
+    fi
+
+    target_library_book_folder="$AUDIOBOOKSHELF_LIBRARY_ROOT/$relative_path_of_book_folder"
+    verbose_log "  Target Library book folder: '$target_library_book_folder'"
+
+    # Check if target book folder is a symlink (problematic if we need to create files inside)
+    if [ -L "$target_library_book_folder" ]; then
+        log_message "  ERROR: Target library path '$target_library_book_folder' exists as a symlink. This script needs it to be a real directory to place hardlinks into. Please remove this symlink manually or adjust your strategy. Skipping this folder."
+        continue
+    fi
+
+    # Ensure target book folder in the main library exists
+    if [ ! -d "$target_library_book_folder" ]; then
+        log_message "  Target library book directory '$target_library_book_folder' does not exist."
+        if [ "$TEST_MODE" == "true" ]; then
+            log_message "    TEST MODE: Would create directory '$target_library_book_folder'."
+        else
+            if ! mkdir -p "$target_library_book_folder"; then
+                log_message "    ERROR: Could not create target library book directory '$target_library_book_folder'. Check permissions. Skipping this folder."
+                continue # Skip to next source_actual_ebook_folder
+            else
+                log_message "    SUCCESS: Created target library book directory '$target_library_book_folder'."
+            fi
+        fi
+    elif [ "$VERBOSE_LOGGING" == "true" ] || [ "$TEST_MODE" == "true" ]; then
+        verbose_log "  Target library book directory '$target_library_book_folder' already exists."
+    fi
+
+    # Hardlink ALL files from the source ebook folder to the target library book folder
+    verbose_log "    Processing files within '$source_actual_ebook_folder' for hardlinking..."
+    find "$source_actual_ebook_folder" -maxdepth 1 -type f | while IFS= read -r source_ebook_file_path; do
+        ebook_filename=$(basename "$source_ebook_file_path")
+        hardlink_target_path="$target_library_book_folder/$ebook_filename"
+        
+        local source_inode target_inode
+        source_inode=$(stat -c %i "$source_ebook_file_path" 2>/dev/null)
+
+        if [ ! -s "$source_ebook_file_path" ] && [ -n "$source_inode" ]; then # Check if source file is empty but has an inode
+             log_message "      WARNING: Source file '$source_ebook_file_path' is empty. Skipping hardlink creation for '$ebook_filename'."
+             continue
+        fi
+        if [ -z "$source_inode" ]; then # Could not get inode for source, or file doesn't exist (e.g. broken symlink in source)
+             log_message "      ERROR: Could not get inode for source file '$source_ebook_file_path' or file is invalid. Skipping '$ebook_filename'."
+             continue
+        fi
+
+        verbose_log "      Found ebook source file: '$source_ebook_file_path' (inode: $source_inode)."
+
+        if [ -e "$hardlink_target_path" ]; then # Target file/link exists
+            target_inode=$(stat -c %i "$hardlink_target_path" 2>/dev/null)
+            if [ "$source_inode" == "$target_inode" ] && [ -n "$target_inode" ]; then # Check if inodes are non-empty and match
+                verbose_log "        Hardlink for '$ebook_filename' already exists and is correct (inodes match: $source_inode). Target: '$hardlink_target_path'"
+            else
+                log_message "        WARNING: File '$hardlink_target_path' already exists but is NOT a hardlink to '$source_ebook_file_path' (target inode: ${target_inode:-N/A}, source inode: $source_inode). Ebook file '$ebook_filename' will be SKIPPED to prevent conflict."
+            fi
+        else # Target does not exist, attempt to create hardlink
+            if [ "$TEST_MODE" == "true" ]; then
+                log_message "        TEST MODE: Would create hardlink: '$hardlink_target_path' -> '$source_ebook_file_path'"
+            else
+                verbose_log "        Creating hardlink: ln \"$source_ebook_file_path\" \"$hardlink_target_path\""
+                output_ln=$(ln "$source_ebook_file_path" "$hardlink_target_path" 2>&1)
+                exit_code_ln=$?
+                if [ $exit_code_ln -eq 0 ]; then
+                    log_message "        SUCCESS: Created HARDLINK '$hardlink_target_path' -> '$source_ebook_file_path'"
+                else
+                    if [[ "$output_ln" == *"Invalid cross-device link"* ]]; then
+                         log_message "        ERROR: Failed to create HARDLINK for '$ebook_filename'. Reason: Invalid cross-device link. ($output_ln)"
+                    elif [[ "$output_ln" == *"File exists"* ]]; then # Should ideally be caught by -e, but as a race condition safeguard
+                         log_message "        WARNING: Could not create HARDLINK for '$ebook_filename'. Reason: File exists (possible race condition). ($output_ln)"
+                    else
+                        log_message "        ERROR: Failed to create HARDLINK for '$ebook_filename'. Exit code: $exit_code_ln. Reason: $output_ln"
+                    fi
+                fi
+            fi
+        fi
+    done # End of files in source_actual_ebook_folder loop
+done # End of source_actual_ebook_folder loop
+
+log_message "--- Script Finished ---"
+if [ "$TEST_MODE" == "true" ]; then
+    log_message "--- !!! Reminder: SCRIPT RAN IN TEST MODE - NO FILE SYSTEM CHANGES WERE MADE !!! ---"
+fi
+echo "Script finished. Log available at $LOG_FILE"
